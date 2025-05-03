@@ -1,15 +1,53 @@
+import { z, ZodIssueCode } from 'zod';
 import { DurableObject } from 'cloudflare:workers';
 
 interface Env {
 	CHAT_ROOM: DurableObjectNamespace<ChatRoom>;
 }
 
+interface ChatMessage {
+	userName: string;
+	message?: string;
+}
+
+interface ChatClientMetadata {
+	userName: string;
+}
+
+// preprocessing zod validation by parsing stringified JSON
+const parseJsonPreprocessor = (value: any, ctx: z.RefinementCtx) => {
+	if (typeof value === 'string') {
+		try {
+			return JSON.parse(value);
+		} catch (e) {
+			ctx.addIssue({
+				code: ZodIssueCode.custom,
+				message: (e as Error).message,
+			});
+		}
+	}
+
+	return value;
+};
+
+const chatMessageSchema = z.preprocess(
+	parseJsonPreprocessor,
+	z.object({
+		userName: z
+			.string()
+			.min(1, { message: 'Name is too short' })
+			.max(32, { message: 'Name is too long' })
+			.regex(/^[a-zA-Z][0-9a-zA-Z-_ ]/),
+		message: z.string().min(1, { message: 'Message is too short' }).max(255, { message: 'Message too long' }).optional(),
+	})
+);
+
 // Worker
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 		const path = url.pathname.slice(1).split('/');
-		const room = path[0] && path[0].length > 0 ? path[0] : 'default';
+		const room = path[0] && path[0].length > 0 ? path[0].toLowerCase() : 'default';
 
 		// Expect to receive a WebSocket Upgrade request.
 		// If there is one, accept the request and return a WebSocket Response.
@@ -31,7 +69,7 @@ export default {
 
 // Durable Object
 export class ChatRoom extends DurableObject {
-	clients: Set<WebSocket>;
+	clients: Map<WebSocket, ChatClientMetadata | undefined>;
 	storage: DurableObjectStorage;
 
 	constructor(state: DurableObjectState, env: Env) {
@@ -39,13 +77,13 @@ export class ChatRoom extends DurableObject {
 		// regular WebSockets do not survive Durable Object resets.
 		//
 		// WebSockets accepted via the Hibernation API can survive
-		// a certain type of eviction, but we will not cover that here.
+		// a certain type of eviction.
 		super(state, env);
 
 		// client sessions bound to this chat room instance
-		this.clients = new Set();
+		this.clients = new Map();
 		this.ctx.getWebSockets().forEach((websocket) => {
-			this.clients.add(websocket);
+			this.clients.set(websocket, undefined);
 		});
 
 		// previous messages storage
@@ -68,7 +106,9 @@ export class ChatRoom extends DurableObject {
 		// (run the `constructor`) and deliver the message to the appropriate handler.
 		this.ctx.acceptWebSocket(server);
 
-		this.clients.add(server);
+		// creating a Map entry with user data undefined
+		// user data should arrive with the first message
+		this.clients.set(server, undefined);
 
 		this.broadcastClientsCount();
 
@@ -79,15 +119,44 @@ export class ChatRoom extends DurableObject {
 	}
 
 	// hibernation websocket methods
-	async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string) {
-		this.clients.forEach((ws) => {
-			try {
-				ws.send(message);
-			} catch (error) {
-				this.clients.delete(ws);
-				this.broadcastClientsCount();
+	async webSocketMessage(ws: WebSocket, message: string) {
+		const userMetaData = this.clients.get(ws);
+
+		// validating message data
+		const parsedMessage = chatMessageSchema.safeParse(message);
+
+		if (!parsedMessage.success) {
+			const errorMessage: ChatMessage = {
+				message: `error:${parsedMessage.error.errors[0].message}`,
+				userName: 'system',
+			};
+			ws.send(JSON.stringify(errorMessage));
+			return;
+		}
+
+		// populating user metadata from the message data
+		if (!parsedMessage.data.userName) {
+			// if no user data found generating metadata from the first message
+			const userName = parsedMessage.data.userName;
+			if (!userMetaData?.userName) {
+				// attach name to the webSocket so it survives hibernation
+				ws.serializeAttachment({ ...ws.deserializeAttachment(), userName });
 			}
-		});
+
+			this.clients.set(ws, { userName });
+		}
+
+		// if message contains message broadcasting it to the room clients
+		if (parsedMessage.data.message) {
+			this.clients.forEach((_, websocket) => {
+				try {
+					websocket.send(JSON.stringify(parsedMessage.data));
+				} catch (error) {
+					this.clients.delete(websocket);
+					this.broadcastClientsCount();
+				}
+			});
+		}
 	}
 
 	async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
@@ -98,11 +167,15 @@ export class ChatRoom extends DurableObject {
 	}
 
 	broadcastClientsCount() {
-		this.clients.forEach((client) => {
+		const message: ChatMessage = {
+			message: `user_count:${this.clients.size}`,
+			userName: 'system',
+		};
+		this.clients.forEach((metadata, websocket) => {
 			try {
-				client.send(`SYSTEM_USER_COUNT: ${this.clients.size}`);
+				websocket.send(JSON.stringify(message));
 			} catch (error) {
-				this.clients.delete(client);
+				this.clients.delete(websocket);
 			}
 		});
 	}

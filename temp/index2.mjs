@@ -1,7 +1,70 @@
+// This is the Edge Chat Demo Worker, built using Durable Objects!
+
+// ===============================
+// Introduction to Modules
+// ===============================
+//
+// The first thing you might notice, if you are familiar with the Workers platform, is that this
+// Worker is written differently from others you may have seen. It even has a different file
+// extension. The `mjs` extension means this JavaScript is an ES Module, which, among other things,
+// means it has imports and exports. Unlike other Workers, this code doesn't use
+// `addEventListener("fetch", handler)` to register its main HTTP handler; instead, it _exports_
+// a handler, as we'll see below.
+//
+// This is a new way of writing Workers that we expect to introduce more broadly in the future. We
+// like this syntax because it is *composable*: You can take two workers written this way and
+// merge them into one worker, by importing the two Workers' exported handlers yourself, and then
+// exporting a new handler that call into the other Workers as appropriate.
+//
+// This new syntax is required when using Durable Objects, because your Durable Objects are
+// implemented by classes, and those classes need to be exported. The new syntax can be used for
+// writing regular Workers (without Durable Objects) too, but for now, you must be in the Durable
+// Objects beta to be able to use the new syntax, while we work out the quirks.
+//
+// To see an example configuration for uploading module-based Workers, check out the wrangler.toml
+// file or one of our Durable Object templates for Wrangler:
+//   * https://github.com/cloudflare/durable-objects-template
+//   * https://github.com/cloudflare/durable-objects-rollup-esm
+//   * https://github.com/cloudflare/durable-objects-webpack-commonjs
+
+// ===============================
+// Required Environment
+// ===============================
+//
+// This worker, when deployed, must be configured with two environment bindings:
+// * rooms: A Durable Object namespace binding mapped to the ChatRoom class.
+// * limiters: A Durable Object namespace binding mapped to the RateLimiter class.
+//
+// Incidentally, in pre-modules Workers syntax, "bindings" (like KV bindings, secrets, etc.)
+// appeared in your script as global variables, but in the new modules syntax, this is no longer
+// the case. Instead, bindings are now delivered in an "environment object" when an event handler
+// (or Durable Object class constructor) is called. Look for the variable `env` below.
+//
+// We made this change, again, for composability: The global scope is global, but if you want to
+// call into existing code that has different environment requirements, then you need to be able
+// to pass the environment as a parameter instead.
+//
+// Once again, see the wrangler.toml file to understand how the environment is configured.
+
+// =======================================================================================
+// The regular Worker part...
+//
+// This section of the code implements a normal Worker that receives HTTP requests from external
+// clients. This part is stateless.
+
+// With the introduction of modules, we're experimenting with allowing text/data blobs to be
+// uploaded and exposed as synthetic modules. In wrangler.toml we specify a rule that files ending
+// in .html should be uploaded as "Data", equivalent to content-type `application/octet-stream`.
+// So when we import it as `HTML` here, we get the HTML content as an `ArrayBuffer`. This lets us
+// serve our app's static asset without relying on any separate storage. (However, the space
+// available for assets served this way is very limited; larger sites should continue to use Workers
+// KV to serve assets.)
+import HTML from './chat.html';
+
 // `handleErrors()` is a little utility function that can wrap an HTTP request handler in a
 // try/catch and return errors to the client. You probably wouldn't want to use this in production
 // code but it is convenient when debugging and iterating.
-async function handleErrors(request: Request, func: () => Promise<any>) {
+async function handleErrors(request, func) {
 	try {
 		return await func();
 	} catch (err) {
@@ -11,12 +74,10 @@ async function handleErrors(request: Request, func: () => Promise<any>) {
 			// frame instead.
 			let pair = new WebSocketPair();
 			pair[1].accept();
-			// @ts-ignore
 			pair[1].send(JSON.stringify({ error: err.stack }));
 			pair[1].close(1011, 'Uncaught exception during session setup');
 			return new Response(null, { status: 101, webSocket: pair[0] });
 		} else {
-			// @ts-ignore
 			return new Response(err.stack, { status: 500 });
 		}
 	}
@@ -31,29 +92,31 @@ async function handleErrors(request: Request, func: () => Promise<any>) {
 // to a handler named `scheduled`, which should be exported here in a similar way. We will be
 // adding other handlers for other types of events over time.
 export default {
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		// let url = new URL(request.url);
-		// let path = url.pathname.slice(1).split('/');
+	async fetch(request, env) {
+		return await handleErrors(request, async () => {
+			// We have received an HTTP request! Parse the URL and route the request.
 
-		return handleApiRequest('default', request, env);
+			let url = new URL(request.url);
+			let path = url.pathname.slice(1).split('/');
 
-		// if (!path[0]) {
-		// 	// Serve our HTML at the root path.
-		// 	return new Response(HTML, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
-		// }
+			if (!path[0]) {
+				// Serve our HTML at the root path.
+				return new Response(HTML, { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+			}
 
-		// switch (path[0]) {
-		// 	case 'api':
-		// 		// This is a request for `/api/...`, call the API handler.
-		// 		return handleApiRequest(path.slice(1), request, env);
+			switch (path[0]) {
+				case 'api':
+					// This is a request for `/api/...`, call the API handler.
+					return handleApiRequest(path.slice(1), request, env);
 
-		// 	default:
-		// 		return new Response('Not found', { status: 404 });
-		// }
+				default:
+					return new Response('Not found', { status: 404 });
+			}
+		});
 	},
 };
 
-async function handleApiRequest(path: string, request: Request, env: Env) {
+async function handleApiRequest(path, request, env) {
 	// We've received at API request. Route the request based on the path.
 
 	switch (path[0]) {
@@ -136,17 +199,14 @@ async function handleApiRequest(path: string, request: Request, env: Env) {
 	}
 }
 
+// =======================================================================================
+// The ChatRoom Durable Object Class
+
 // ChatRoom implements a Durable Object that coordinates an individual chat room. Participants
 // connect to the room using WebSockets, and the room broadcasts messages from each participant
 // to all others.
 export class ChatRoom {
-	state;
-	storage;
-	env;
-	sessions: Map<WebSocket, any>;
-	lastTimestamp;
-
-	constructor(state: DurableObjectState, env: Env & { limiters: any }) {
+	constructor(state, env) {
 		this.state = state;
 
 		// `state.storage` provides access to our durable storage. It provides a simple KV
@@ -169,13 +229,13 @@ export class ChatRoom {
 			let limiterId = this.env.limiters.idFromString(meta.limiterId);
 			let limiter = new RateLimiterClient(
 				() => this.env.limiters.get(limiterId),
-				(err: Error) => webSocket.close(1011, err.stack)
+				(err) => webSocket.close(1011, err.stack)
 			);
 
 			// We don't send any messages to the client until it has sent us the initial user info
 			// message. Until then, we will queue messages in `session.blockedMessages`.
 			// This could have been arbitrarily large, so we won't put it in the attachment.
-			let blockedMessages: string[] = [];
+			let blockedMessages = [];
 			this.sessions.set(webSocket, { ...meta, limiter, blockedMessages });
 		});
 
@@ -190,7 +250,7 @@ export class ChatRoom {
 	// can only be sent from other Worker code, such as the code above; these requests don't come
 	// directly from the internet. In the future, we will support other formats than HTTP for these
 	// communications, but we started with HTTP for its familiarity.
-	async fetch(request: Request) {
+	async fetch(request) {
 		return await handleErrors(request, async () => {
 			let url = new URL(request.url);
 
@@ -204,9 +264,6 @@ export class ChatRoom {
 
 					// Get the client's IP address for use with the rate limiter.
 					let ip = request.headers.get('CF-Connecting-IP');
-					if (!ip) {
-						throw 'IP not found';
-					}
 
 					// To accept the WebSocket request, we create a WebSocketPair (which is like a socketpair,
 					// i.e. two WebSockets that talk to each other), we return one end of the pair in the
@@ -229,7 +286,7 @@ export class ChatRoom {
 	}
 
 	// handleSession() implements our WebSocket-based chat protocol.
-	async handleSession(webSocket: WebSocket, ip: string) {
+	async handleSession(webSocket, ip) {
 		// Accept our end of the WebSocket. This tells the runtime that we'll be terminating the
 		// WebSocket in JavaScript, not sending it elsewhere.
 		this.state.acceptWebSocket(webSocket);
@@ -238,7 +295,7 @@ export class ChatRoom {
 		let limiterId = this.env.limiters.idFromName(ip);
 		let limiter = new RateLimiterClient(
 			() => this.env.limiters.get(limiterId),
-			(err: Error) => webSocket.close(1011, err.stack)
+			(err) => webSocket.close(1011, err.stack)
 		);
 
 		// Create our session and add it to the sessions map.
@@ -264,7 +321,7 @@ export class ChatRoom {
 		});
 	}
 
-	async webSocketMessage(webSocket: WebSocket, msg: string) {
+	async webSocketMessage(webSocket, msg) {
 		try {
 			let session = this.sessions.get(webSocket);
 			if (session.quit) {
@@ -350,7 +407,7 @@ export class ChatRoom {
 
 	// On "close" and "error" events, remove the WebSocket from the sessions list and broadcast
 	// a quit message.
-	async closeOrErrorHandler(webSocket: WebSocket) {
+	async closeOrErrorHandler(webSocket) {
 		let session = this.sessions.get(webSocket) || {};
 		session.quit = true;
 		this.sessions.delete(webSocket);
@@ -359,16 +416,16 @@ export class ChatRoom {
 		}
 	}
 
-	async webSocketClose(webSocket: WebSocket, code, reason, wasClean) {
+	async webSocketClose(webSocket, code, reason, wasClean) {
 		this.closeOrErrorHandler(webSocket);
 	}
 
-	async webSocketError(webSocket: WebSocket, error) {
+	async webSocketError(webSocket, error) {
 		this.closeOrErrorHandler(webSocket);
 	}
 
 	// broadcast() broadcasts a message to all clients.
-	broadcast(message: string) {
+	broadcast(message) {
 		// Apply JSON if we weren't given a string to start with.
 		if (typeof message !== 'string') {
 			message = JSON.stringify(message);
@@ -413,8 +470,7 @@ export class ChatRoom {
 // global, i.e. they apply across all chat rooms, so if a user spams one chat room, they will find
 // themselves rate limited in all other chat rooms simultaneously.
 export class RateLimiter {
-	nextAllowedTime;
-	constructor(state: DurableObjectState, env: Env) {
+	constructor(state, env) {
 		// Timestamp at which this IP will next be allowed to send a message. Start in the distant
 		// past, i.e. the IP can send a message now.
 		this.nextAllowedTime = 0;
@@ -423,7 +479,7 @@ export class RateLimiter {
 	// Our protocol is: POST when the IP performs an action, or GET to simply read the current limit.
 	// Either way, the result is the number of seconds to wait before allowing the IP to perform its
 	// next action.
-	async fetch(request: Request) {
+	async fetch(request) {
 		return await handleErrors(request, async () => {
 			let now = Date.now() / 1000;
 
@@ -440,7 +496,7 @@ export class RateLimiter {
 			// We provide a "grace" period of 20 seconds, meaning that the client can make 4-5 requests
 			// in a quick burst before they start being limited.
 			let cooldown = Math.max(0, this.nextAllowedTime - now - 20);
-			return new Response(cooldown.toString());
+			return new Response(cooldown);
 		});
 	}
 }
