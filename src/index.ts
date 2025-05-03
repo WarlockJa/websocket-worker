@@ -7,6 +7,10 @@ interface Env {
 // Worker
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+		const url = new URL(request.url);
+		const path = url.pathname.slice(1).split('/');
+		const room = path[0] && path[0].length > 0 ? path[0] : 'default';
+
 		// Expect to receive a WebSocket Upgrade request.
 		// If there is one, accept the request and return a WebSocket Response.
 		const upgradeHeader = request.headers.get('Upgrade');
@@ -18,7 +22,7 @@ export default {
 
 		// This example will refer to the same Durable Object,
 		// since the name "foo" is hardcoded.
-		let id = env.CHAT_ROOM.idFromName('default');
+		let id = env.CHAT_ROOM.idFromName(room);
 		let stub = env.CHAT_ROOM.get(id);
 
 		return stub.fetch(request);
@@ -89,6 +93,7 @@ export class ChatRoom extends DurableObject {
 	async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
 		// If the client closes the connection, the runtime will invoke the webSocketClose() handler.
 		ws.close(code, 'Durable Object is closing WebSocket');
+		this.clients.delete(ws);
 		this.broadcastClientsCount();
 	}
 
