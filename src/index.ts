@@ -110,7 +110,11 @@ export class ChatRoom extends DurableObject {
 		// user data should arrive with the first message
 		this.clients.set(server, undefined);
 
+		// sending number of users in the chat room
 		this.broadcastClientsCount();
+
+		// sending 100 last messages to the client
+		await this.sendHistory(server);
 
 		return new Response(null, {
 			status: 101,
@@ -148,6 +152,7 @@ export class ChatRoom extends DurableObject {
 
 		// if message contains message broadcasting it to the room clients
 		if (parsedMessage.data.message) {
+			// broadcasting message
 			this.clients.forEach((_, websocket) => {
 				try {
 					websocket.send(JSON.stringify(parsedMessage.data));
@@ -156,6 +161,10 @@ export class ChatRoom extends DurableObject {
 					this.broadcastClientsCount();
 				}
 			});
+
+			// saving message to storage
+			const key = new Date().toISOString();
+			await this.storage.put(key, JSON.stringify(parsedMessage.data));
 		}
 	}
 
@@ -178,5 +187,18 @@ export class ChatRoom extends DurableObject {
 				this.clients.delete(websocket);
 			}
 		});
+	}
+
+	async sendHistory(ws: WebSocket) {
+		// Load the last 100 messages from the chat history stored on disk, and send them to the
+		// client.
+		const storage = await this.storage.list({ reverse: true, limit: 100 });
+		const backlog = [...storage.values()] as ChatMessage[];
+		const historyMessage: ChatMessage = {
+			userName: 'system',
+			message: `history:${JSON.stringify(backlog.reverse())}`,
+		};
+
+		ws.send(JSON.stringify(historyMessage));
 	}
 }
