@@ -13,7 +13,7 @@
 	"durable_objects": {
 		"bindings": [
 			{ "name": "CHAT_ROOM", "class_name": "ChatRoom" }
-			// { "name": "limiters", "class_name": "RateLimiter" }
+			// { "name": "LIMITERS", "class_name": "RateLimiter" }
 		]
 	},
 	"migrations": [
@@ -25,7 +25,9 @@
 			"tag": "v2",
 			"deleted_classes": ["ChatRoom", "RateLimiter"]
 		},
-		{ "tag": "v3", "new_classes": ["ChatRoom"] }
+		{ "tag": "v3", "new_classes": ["ChatRoom"] },
+		{ "tag": "v4", "new_classes": ["RateLimiter"] },
+		{ "tag": "v5", "deleted_classes": ["RateLimiter"] }
 	]
 	/**
 	 * Smart Placement
