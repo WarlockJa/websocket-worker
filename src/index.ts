@@ -1,9 +1,5 @@
-import { z, ZodIssueCode } from 'zod';
+import { z } from 'zod';
 import { DurableObject } from 'cloudflare:workers';
-
-interface Env {
-	CHAT_ROOM: DurableObjectNamespace<ChatRoom>;
-}
 
 interface ChatMessage {
 	userName: string;
@@ -21,7 +17,7 @@ const parseJsonPreprocessor = (value: any, ctx: z.RefinementCtx) => {
 			return JSON.parse(value);
 		} catch (e) {
 			ctx.addIssue({
-				code: ZodIssueCode.custom,
+				code: 'custom',
 				message: (e as Error).message,
 			});
 		}
@@ -39,7 +35,7 @@ const chatMessageSchema = z.preprocess(
 			.max(32, { message: 'Name is too long' })
 			.regex(/^[a-zA-Z][0-9a-zA-Z-_ ]/),
 		message: z.string().min(1, { message: 'Message is too short' }).max(255, { message: 'Message too long' }).optional(),
-	})
+	}),
 );
 
 // Worker
@@ -131,7 +127,7 @@ export class ChatRoom extends DurableObject {
 
 		if (!parsedMessage.success) {
 			const errorMessage: ChatMessage = {
-				message: `error:${parsedMessage.error.errors[0].message}`,
+				message: `error:${parsedMessage.error.message}`,
 				userName: 'system',
 			};
 			ws.send(JSON.stringify(errorMessage));
